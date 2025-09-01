@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.helpers.test.AssertSubscriber;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
@@ -91,6 +92,7 @@ public class MutinyClientCallsTest {
 
         try (MockedStatic<StubInvocationUtil> mocked = Mockito.mockStatic(StubInvocationUtil.class)) {
             AtomicBoolean stubCalled = new AtomicBoolean(false);
+            CountDownLatch subscribed = new CountDownLatch(1);
 
             mocked.when(() -> StubInvocationUtil.serverStreamCall(
                             Mockito.eq(invoker), Mockito.eq(method), Mockito.eq("testRequest"), Mockito.any()))
@@ -98,9 +100,12 @@ public class MutinyClientCallsTest {
                         stubCalled.set(true);
                         ClientTripleMutinyPublisher<String> publisher = invocation.getArgument(3);
 
+                        // register upstream
                         CallStreamObserver<String> fakeSubscription = new CallStreamObserver<>() {
                             @Override
-                            public void request(int n) {}
+                            public void request(int n) {
+                                /* no-op */
+                            }
 
                             @Override
                             public void setCompression(String compression) {}
@@ -109,8 +114,8 @@ public class MutinyClientCallsTest {
                             public void disableAutoFlowControl() {}
 
                             @Override
-                            public void onNext(String value) {
-                                publisher.onNext(value);
+                            public void onNext(String v) {
+                                publisher.onNext(v);
                             }
 
                             @Override
@@ -123,13 +128,22 @@ public class MutinyClientCallsTest {
                                 publisher.onCompleted();
                             }
                         };
-
                         publisher.onSubscribe(fakeSubscription);
 
+                        // waiting for downstream
                         new Thread(() -> {
-                                    publisher.onNext("item1");
-                                    publisher.onNext("item2");
-                                    publisher.onCompleted();
+                                    try {
+                                        if (subscribed.await(2, TimeUnit.SECONDS)) {
+                                            publisher.onNext("item1");
+                                            publisher.onNext("item2");
+                                            publisher.onCompleted();
+                                        } else {
+                                            publisher.onError(new IllegalStateException("Downstream not subscribed"));
+                                        }
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                        publisher.onError(e);
+                                    }
                                 })
                                 .start();
 
@@ -137,15 +151,17 @@ public class MutinyClientCallsTest {
                     });
 
             Uni<String> uniRequest = Uni.createFrom().item("testRequest");
-
             Multi<String> multiResponse = MutinyClientCalls.oneToMany(invoker, uniRequest, method);
 
-            List<String> collectedItems =
-                    multiResponse.collect().asList().await().indefinitely();
+            // use AssertSubscriber in Mutiny to wait for subscribing
+            AssertSubscriber<String> sub = AssertSubscriber.create(Long.MAX_VALUE);
+            multiResponse.subscribe().withSubscriber(sub);
+            sub.awaitSubscription();
+            subscribed.countDown();
 
-            Assertions.assertTrue(stubCalled.get(), "StubInvocationUtil.serverStreamCall should be called");
-            Assertions.assertEquals(2, collectedItems.size());
-            Assertions.assertEquals(List.of("item1", "item2"), collectedItems);
+            sub.awaitCompletion();
+            Assertions.assertTrue(stubCalled.get(), "serverStreamCall should be called");
+            Assertions.assertEquals(List.of("item1", "item2"), sub.getItems());
         }
     }
 
